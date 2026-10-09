@@ -1,0 +1,12 @@
+{
+  "type": "plugin",
+  "domain": "radio_filter",
+  "name": "Radio Filter",
+  "description": "Filter internet radio playback using rules and optional replacement music.",
+  "codeowners": [
+    "@3115a083"
+  ],
+  "requirements": [],
+  "documentation": "https://github.com/3115a083/ma---Radio-Filter",
+  "multi_instance": false
+}
