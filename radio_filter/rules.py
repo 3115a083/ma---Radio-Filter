@@ -92,7 +92,7 @@ def validate_action(raw: Any) -> dict[str, Any]:
         raise ValueError("Unknown return_mode")
     allowed = {
         "mode", "uri", "return_mode", "artist", "genre", "shuffle",
-        "match_duration", "blocked_duration_seconds",
+        "match_duration", "blocked_duration_seconds", "title",
     }
     if set(raw) - allowed:
         raise ValueError("Unknown action options")
@@ -106,7 +106,7 @@ def validate_action(raw: Any) -> dict[str, Any]:
     elif "uri" in raw:
         raise ValueError("action.uri is not used for this mode")
     if mode == "random":
-        for fieldname in ("artist", "genre"):
+        for fieldname in ("artist", "genre", "title"):
             if fieldname in raw:
                 action[fieldname] = _text(raw[fieldname], fieldname)
         if "match_duration" in raw:
@@ -118,7 +118,7 @@ def validate_action(raw: Any) -> dict[str, Any]:
             if type(value) is not int or not 0 <= value <= 7200:
                 raise ValueError("blocked_duration_seconds must be 0..7200")
             action["blocked_duration_seconds"] = value
-    elif any(key in raw for key in ("artist", "genre", "match_duration", "blocked_duration_seconds")):
+    elif any(key in raw for key in ("artist", "genre", "title", "match_duration", "blocked_duration_seconds")):
         raise ValueError("Random-only options used for a different mode")
     if "shuffle" in raw:
         if mode != "playlist" or type(raw["shuffle"]) is not bool:
