@@ -50,7 +50,9 @@ class SecurityTests(unittest.TestCase):
     def test_unsafe_action_uri(self):
         for uri in ("file:///etc/passwd", "http://host/track/test",
                     "spotify://track/../../etc/passwd\nnew",
-                    "spotify://radio/test", "spotify://track/"):
+                    "spotify://radio/test", "spotify://track/",
+                    "spotify://track/../../etc/passwd",
+                    "spotify://track/%2E%2e/etc/passwd"):
             with self.subTest(uri=uri), self.assertRaises(ValueError):
                 rules.validate_action({"mode": "track", "uri": uri})
 
