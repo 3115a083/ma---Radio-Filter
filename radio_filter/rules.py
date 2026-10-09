@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 MAX_RULES = 200
 MAX_CONFIG_BYTES = 131072
@@ -102,6 +102,9 @@ def validate_action(raw: Any) -> dict[str, Any]:
         match = URI_PATTERN.fullmatch(uri)
         if not match or match.group(1) != mode:
             raise ValueError("action.uri must be an MA URI of the selected media type")
+        media_id = unquote(uri.split("/", 3)[-1])
+        if any(part in (".", "..") for part in media_id.replace("\\", "/").split("/")):
+            raise ValueError("Relative path components in media URIs are not allowed")
         action["uri"] = uri
     elif "uri" in raw:
         raise ValueError("action.uri is not used for this mode")
