@@ -54,6 +54,8 @@ def rules_from_form(values: dict[str, Any], count: int) -> list[Rule]:
             continue
         mode = read("mode", "mute")
         return_mode = read("return", "when_clear")
+        if mode in {"mute", "radio"}:
+            return_mode = "when_clear"
         action: dict[str, Any] = {"mode": mode, "return_mode": return_mode}
         if mode == "radio":
             action["uri"] = read("target_radio")
@@ -119,9 +121,13 @@ async def build_form(provider) -> tuple:
             provider.logger.warning("Radio Filter: library selectors unavailable: %s", type(exc).__name__)
             return []
 
-    radios = await items(provider.mass.music.radio, 300)
-    tracks = await items(provider.mass.music.tracks, 300)
-    playlists = await items(provider.mass.music.playlists, 300)
+    import asyncio
+
+    radios, tracks, playlists = await asyncio.gather(
+        items(provider.mass.music.radio, 300),
+        items(provider.mass.music.tracks, 300),
+        items(provider.mass.music.playlists, 300),
+    )
     radio_options = select_options(radios, include_all=True)
     track_options = select_options(tracks)
     playlist_options = select_options(playlists)
