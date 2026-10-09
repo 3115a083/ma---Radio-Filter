@@ -1,18 +1,47 @@
-name: Tests
+name: Tests and security regressions
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: radio-filter-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, SHA-pinned
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5, SHA-pinned
         with:
           python-version: '3.13'
       - name: Compile plugin
         run: python -m compileall -q radio_filter
-      - name: Test rule engine
+      - name: Rule and security regression tests
         run: python -m unittest discover -s tests -v
+      - name: Reject accidental plaintext credentials or executable scripts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import ast
+          sources = list(Path("radio_filter").glob("*.py"))
+          for path in sources:
+              tree = ast.parse(path.read_text())
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.Import, ast.ImportFrom)):
+                      names = ([item.name for item in node.names] if isinstance(node, ast.Import)
+                              else [node.module or ""])
+                      for name in names:
+                          if name.split(".")[0] in {"subprocess", "pickle", "marshal"}:
+                              raise SystemExit(f"Forbidden import: {name} in {path}")
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                      if node.func.id in {"eval", "exec", "compile", "__import__"}:
+                          raise SystemExit(f"Forbidden dynamic code execution: {node.func.id} in {path}")
+          PY
