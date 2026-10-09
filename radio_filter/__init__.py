@@ -16,7 +16,8 @@ from music_assistant_models.enums import ConfigEntryType, MediaType, PlaybackSta
 from music_assistant.models.plugin import PluginProvider
 
 from .icy import IcyMonitor
-from .rules import Rule, load_rules, normalize, split_title
+from .gui import COUNT_KEY, DEFAULT_COUNT, MAX_GUI_RULES, build_form, rules_from_form
+from .rules import Rule, load_rules, normalize, split_title, validate_action
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -80,50 +81,84 @@ class RadioFilter(PluginProvider):
         self._muted: dict[str, Muted] = {}
         self._replacement: dict[str, Replacement] = {}
         self._ignore_title: dict[str, str] = {}
+        self._library_lock = asyncio.Lock()
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Expose global blacklist and station-rule editor in provider settings."""
-        return (
-            ConfigEntry(
-                key=CONF_ARTISTS, type=ConfigEntryType.STRING, required=False,
-                label="Blocked artists (one per line)", default_value="",
-            ),
-            ConfigEntry(
-                key=CONF_SONGS, type=ConfigEntryType.STRING, required=False,
-                label="Blocked songs (one per line, title or Artist - Title)", default_value="",
-            ),
-            ConfigEntry(
-                key=CONF_DEFAULT_ACTION, type=ConfigEntryType.STRING, required=True,
-                label="Default blacklist action (JSON)", default_value=DEFAULT_ACTION,
-            ),
-            ConfigEntry(
-                key=CONF_RULES, type=ConfigEntryType.STRING, required=True,
-                label="Station/radiotext/time rules (JSON array)", default_value="[]",
-            ),
-            ConfigEntry(
-                key=CONF_TIMEZONE, type=ConfigEntryType.STRING, required=True,
-                label="Schedule timezone (IANA name)", default_value="Europe/Berlin",
-            ),
-            ConfigEntry(
-                key=CONF_POLL, type=ConfigEntryType.INTEGER, required=True,
-                label="Detection interval (seconds)", default_value=2,
-            ),
+        """Show Music Assistant-native rule forms and library selectors, never JSON input."""
+        entries = await build_form(self)
+        # Hidden legacy fields support previously saved rules without requiring users
+        # to write code in the new form.
+        legacy = (
+            ConfigEntry(key=CONF_ARTISTS, type=ConfigEntryType.STRING,
+                        default_value="", hidden=True, required=False),
+            ConfigEntry(key=CONF_SONGS, type=ConfigEntryType.STRING,
+                        default_value="", hidden=True, required=False),
+            ConfigEntry(key=CONF_RULES, type=ConfigEntryType.STRING,
+                        default_value="[]", hidden=True, required=False),
+            ConfigEntry(key=CONF_DEFAULT_ACTION, type=ConfigEntryType.STRING,
+                        default_value=DEFAULT_ACTION, hidden=True, required=False),
+            ConfigEntry(key=CONF_TIMEZONE, type=ConfigEntryType.STRING,
+                        label="Timezone for schedules", default_value="Europe/Berlin"),
+            ConfigEntry(key=CONF_POLL, type=ConfigEntryType.INTEGER,
+                        label="Detection interval (seconds)", default_value=2,
+                        range=(1, 30)),
         )
+        return legacy + entries
+
+    async def handle_config_action(self, action: str):
+        """Add/remove a form row without requiring the user to edit JSON."""
+        count = int(self.get_config_value(COUNT_KEY, DEFAULT_COUNT))
+        count = min(MAX_GUI_RULES, max(1, count))
+        if action == "add_rule":
+            if count < MAX_GUI_RULES:
+                self._update_config_value(COUNT_KEY, count + 1, immediate=True)
+            return await self.get_config_entries()
+        if action == "remove_rule":
+            if count > 1:
+                # Disable removed row; stale stored values cannot reactivate later.
+                self._update_config_value(f"rule_{count}_kind", "off", immediate=True)
+                self._update_config_value(COUNT_KEY, count - 1, immediate=True)
+            return await self.get_config_entries()
+        return await super().handle_config_action(action)
 
     async def handle_async_init(self) -> None:
-        """Validate configuration before enabling the filter."""
-        default_action = json.loads(str(self.get_config_value(CONF_DEFAULT_ACTION, DEFAULT_ACTION)))
-        if not isinstance(default_action, dict):
-            raise ValueError("Default action must be a JSON object")
-        self._rules = load_rules(
+        """Load bounded legacy configuration plus validated GUI rules."""
+        raw_action = str(self.get_config_value(CONF_DEFAULT_ACTION, DEFAULT_ACTION))
+        if len(raw_action) > 8192:
+            raise ValueError("Default action configuration too large")
+        default_action = validate_action(json.loads(raw_action))
+        base_rules = load_rules(
             str(self.get_config_value(CONF_RULES, "[]")),
             str(self.get_config_value(CONF_ARTISTS, "")),
             str(self.get_config_value(CONF_SONGS, "")),
             default_action,
         )
+        count = int(self.get_config_value(COUNT_KEY, DEFAULT_COUNT))
+        values = {}
+        for slot in range(1, min(MAX_GUI_RULES, max(count, 0)) + 1):
+            for name in (
+                "kind", "pattern", "station", "days", "start", "end", "mode",
+                "target_radio", "target_track", "track_name", "target_playlist",
+                "shuffle", "random_artist", "random_genre", "match_duration",
+                "duration", "return", "max_seconds", "monitor_url",
+            ):
+                default = [] if name == "days" else (
+                    False if name in {"shuffle", "match_duration"} else
+                    300 if name == "max_seconds" else
+                    0 if name == "duration" else
+                    "off" if name == "kind" else
+                    "mute" if name == "mode" else
+                    "when_clear" if name == "return" else ""
+                )
+                key = f"rule_{slot}_{name}"
+                values[key] = self.get_config_value(key, default)
+        gui_rules = rules_from_form(values, count)
+        self._rules = sorted(base_rules + gui_rules, key=lambda r: bool(r.station), reverse=True)
+        if len(self._rules) > 200:
+            raise ValueError("Too many filter rules")
         self._tz = ZoneInfo(str(self.get_config_value(CONF_TIMEZONE, "Europe/Berlin")))
         self._interval = max(1.0, min(float(self.get_config_value(CONF_POLL, 2)), 30.0))
-        self.logger.info("Radio Filter: %d blocking rules loaded", len(self._rules))
+        self.logger.info("Radio Filter: %d validated rules active", len(self._rules))
 
     async def loaded_in_mass(self) -> None:
         """Start a single asynchronous poller for active radio queues."""
@@ -202,10 +237,11 @@ class RadioFilter(PluginProvider):
         station = str(media.name)
         details = getattr(item, "streamdetails", None)
         radio_text = str(getattr(details, "stream_title", None) or "")
+        title_key = f"{uri}|{normalize(radio_text)}"
         ignore = self._ignore_title.get(queue_id)
-        if ignore and normalize(radio_text) != ignore:
+        if ignore and title_key != ignore:
             self._ignore_title.pop(queue_id, None)
-        if self._ignore_title.get(queue_id) == normalize(radio_text):
+        if self._ignore_title.get(queue_id) == title_key:
             if queue_id in self._muted:
                 await self._unmute(queue_id)
             return
@@ -220,7 +256,7 @@ class RadioFilter(PluginProvider):
             current_mute = None
         if current_mute and time.monotonic() - current_mute.started >= rule.max_seconds:
             await self._unmute(queue_id)
-            self._ignore_title[queue_id] = normalize(radio_text)
+            self._ignore_title[queue_id] = title_key
             return
         if current_mute:
             return
@@ -284,7 +320,7 @@ class RadioFilter(PluginProvider):
             if not rule.monitor_url.startswith(("http://", "https://")):
                 self.logger.warning("Radio Filter: monitor_url must be HTTP(S)")
             else:
-                monitor = IcyMonitor(self.mass.http_session, rule.monitor_url, self.logger)
+                monitor = IcyMonitor(rule.monitor_url, self.logger)
                 monitor.start()
         session = Replacement(
             original_uri=uri, station=station, original_text=title,
@@ -307,9 +343,17 @@ class RadioFilter(PluginProvider):
         """Pick one library track, optionally matching artist/genre/duration."""
         artist_filter = normalize(str(action.get("artist", "")))
         genre_filter = normalize(str(action.get("genre", "")))
-        candidates = await self.mass.music.tracks.library_items(limit=500, summary=False)
+        wanted_title = normalize(str(action.get("title", "")))
+        if wanted_title:
+            candidates = await self.mass.music.tracks.library_items(
+                search=str(action["title"]), limit=100, summary=False
+            )
+        else:
+            candidates = await self.mass.music.tracks.library_items(limit=500, summary=False)
         matches = []
         for track in candidates:
+            if wanted_title and normalize(str(getattr(track, "name", ""))) != wanted_title:
+                continue
             artists = getattr(track, "artists", ()) or ()
             names = [normalize(str(getattr(artist, "name", ""))) for artist in artists]
             if artist_filter and artist_filter not in names:
@@ -375,19 +419,21 @@ class RadioFilter(PluginProvider):
             await self._cancel_replacement(queue_id)
             return
         if session.mode in {"track", "random"} and playing_uri and playing_uri != session.target_uri:
-            if session.return_mode == "one_song":
-                await self._return_to_radio(queue_id)
-            else:
-                await self._cancel_replacement(queue_id)
+            # An unrelated song chosen by a user must never be replaced by the plugin.
+            await self._cancel_replacement(queue_id)
             return
         if session.return_mode == "one_song":
             if playing_uri and not session.first_track_uri:
                 session.first_track_uri = playing_uri
                 session.first_track_seen = True
             if session.first_track_uri and playing_uri and playing_uri != session.first_track_uri:
-                await self._return_to_radio(queue_id)
+                # Playlist advanced naturally to the next song.
+                if session.mode == "playlist":
+                    await self._return_to_radio(queue_id)
+                else:
+                    await self._cancel_replacement(queue_id)
                 return
-            if queue.state == PlaybackState.IDLE and session.first_track_seen:
+            if bool(getattr(queue, "ended", False)) and session.first_track_seen:
                 await self._return_to_radio(queue_id)
                 return
         if session.return_mode == "when_clear" and session.monitor:
@@ -417,7 +463,9 @@ class RadioFilter(PluginProvider):
             return
         await self._cancel_replacement(queue_id)
         # One-song/timeout return may happen while the blocked title is still live.
-        self._ignore_title[queue_id] = normalize(session.original_text)
+        self._ignore_title[queue_id] = (
+            f"{session.original_uri}|{normalize(session.original_text)}"
+        )
         try:
             await self.mass.player_queues.play_media(
                 queue_id, session.original_uri, option=QueueOption.REPLACE,
