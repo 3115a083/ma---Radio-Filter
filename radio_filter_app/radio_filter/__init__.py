@@ -75,6 +75,8 @@ class RadioFilter(PluginProvider):
         """Initialize state; provider options are loaded in handle_async_init."""
         super().__init__(mass, manifest, config)
         self._rules: list[Rule] = []
+        self._blocked_artists: frozenset[str] = frozenset()
+        self._blocked_songs: frozenset[str] = frozenset()
         self._tz = ZoneInfo("Europe/Berlin")
         self._interval = 2.0
         self._worker: asyncio.Task | None = None
@@ -153,6 +155,10 @@ class RadioFilter(PluginProvider):
                 values[key] = self.get_config_value(key, default)
         gui_rules = rules_from_form(values, count)
         self._rules = sorted(base_rules + gui_rules, key=lambda r: bool(r.station), reverse=True)
+        self._blocked_artists = frozenset(normalize(r.pattern) for r in self._rules
+                                          if not r.station and r.kind == "artist")
+        self._blocked_songs = frozenset(normalize(r.pattern) for r in self._rules
+                                        if not r.station and r.kind == "song")
         if len(self._rules) > 200:
             raise ValueError("Too many filter rules")
         self._tz = ZoneInfo(str(self.get_config_value(CONF_TIMEZONE, "Europe/Berlin")))
@@ -194,16 +200,22 @@ class RadioFilter(PluginProvider):
         """Handle changing metadata, schedules and interruption endings."""
         while True:
             try:
-                active = set()
-                for queue in self.mass.player_queues.all():
-                    queue_id = queue.queue_id
-                    active.add(queue_id)
-                    try:
-                        await self._process_queue(queue)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        self.logger.exception("Radio Filter: error on queue %s", queue_id)
+                queues = self.mass.player_queues.all()
+                active = {queue.queue_id for queue in queues}
+                limiter = asyncio.Semaphore(4)
+
+                async def process(queue) -> None:
+                    async with limiter:
+                        try:
+                            await self._process_queue(queue)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            self.logger.exception(
+                                "Radio Filter: error on queue %s", queue.queue_id
+                            )
+
+                await asyncio.gather(*(process(queue) for queue in queues))
                 for queue_id in set(self._muted) - active:
                     self._muted.pop(queue_id, None)
                 for queue_id in set(self._replacement) - active:
@@ -390,14 +402,17 @@ class RadioFilter(PluginProvider):
         return 0
 
     def _blocked_library_track(self, track) -> bool:
-        """Avoid choosing a globally blacklisted replacement track."""
-        artists = [a.name for a in (getattr(track, "artists", ()) or ())]
-        for rule in self._rules:
-            if rule.station or rule.kind not in {"artist", "song"}:
-                continue
-            for artist in (artists or [""]):
-                if rule.matches(artist, track.name, "", datetime.now(self._tz)):
-                    return True
+        """Reject globally blacklisted artists and songs with precomputed sets."""
+        title = normalize(str(getattr(track, "name", "")))
+        if title in self._blocked_songs:
+            return True
+        artists = (getattr(track, "artists", ()) or ())
+        for artist in artists:
+            normalized = normalize(str(getattr(artist, "name", "")))
+            if normalized in self._blocked_artists:
+                return True
+            if normalize(f"{normalized} - {title}") in self._blocked_songs:
+                return True
         return False
 
     async def _check_replacement(self, queue) -> None:
