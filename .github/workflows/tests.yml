@@ -26,6 +26,11 @@ jobs:
         run: python -m compileall -q radio_filter
       - name: Rule and security regression tests
         run: python -m unittest discover -s tests -v
+      - name: Verify Home Assistant app ships identical audited provider files
+        run: |
+          for name in __init__.py gui.py rules.py icy.py manifest.json; do
+            cmp "radio_filter/$name" "radio_filter_app/radio_filter/$name"
+          done
       - name: Reject accidental plaintext credentials or executable scripts
         run: |
           python - <<'PY'
