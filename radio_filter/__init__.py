@@ -81,7 +81,6 @@ class RadioFilter(PluginProvider):
         self._muted: dict[str, Muted] = {}
         self._replacement: dict[str, Replacement] = {}
         self._ignore_title: dict[str, str] = {}
-        self._library_lock = asyncio.Lock()
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Show Music Assistant-native rule forms and library selectors, never JSON input."""
@@ -316,12 +315,11 @@ class RadioFilter(PluginProvider):
             return
         return_mode = str(action.get("return_mode", "when_clear"))
         monitor = None
-        if rule.monitor_url:
-            if not rule.monitor_url.startswith(("http://", "https://")):
-                self.logger.warning("Radio Filter: monitor_url must be HTTP(S)")
-            else:
-                monitor = IcyMonitor(rule.monitor_url, self.logger)
-                monitor.start()
+        if rule.monitor_url and len([
+            item for item in self._replacement.values() if item.monitor is not None
+        ]) < 4:
+            monitor = IcyMonitor(rule.monitor_url, self.logger)
+            monitor.start()
         session = Replacement(
             original_uri=uri, station=station, original_text=title,
             rule=rule, target_uri=target, mode=mode, return_mode=return_mode,
@@ -409,13 +407,25 @@ class RadioFilter(PluginProvider):
         elapsed = time.monotonic() - session.started
         if elapsed < 3:
             return
+        # A pause, stop, group-source transfer or manual queue change must take precedence
+        # over the plugin's delayed automatic return.
+        if not getattr(queue, "active", True) or (
+            queue.state != PlaybackState.PLAYING
+            and not (session.return_mode == "one_song" and getattr(queue, "ended", False))
+        ):
+            await self._cancel_replacement(queue_id)
+            return
         current = getattr(queue, "current_item", None)
         media = getattr(current, "media_item", None)
         playing_uri = str(getattr(media, "uri", "") or "")
-        source_items = getattr(queue, "source_items", ()) or ()
+        queue_data = self.mass.player_queues.queue_data_or_none(queue_id)
+        source_items = getattr(queue_data, "source_items", ()) or ()
         sources = {str(getattr(source, "uri", "") or "") for source in source_items}
-        # If the user starts something else, never hijack their next selection.
+        # Always use the real queue source_items, not PlayerQueue's projected UI sources.
         if sources and session.target_uri not in sources:
+            await self._cancel_replacement(queue_id)
+            return
+        if session.mode == "radio" and playing_uri and playing_uri != session.target_uri:
             await self._cancel_replacement(queue_id)
             return
         if session.mode in {"track", "random"} and playing_uri and playing_uri != session.target_uri:
